@@ -4228,10 +4228,16 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
        * ParentKey; these turn that into a nested tree and compute how complete each branch is. No DOM, no
        * provider, no Pict -- just data, so the view and the tests lean on the same math.
        *
-       * Progress is leaf-based: a leaf (an item with no children) is one unit of work, done or not; a group
-       * (an item with children) has no checkbox of its own, it shows the share of its leaf descendants that
-       * are done. So "how far through this tier" always means "how many of the actual tasks under it are
-       * checked," at every level and overall.
+       * Progress is hierarchically weighted: each node splits its share of the whole equally among its
+       * children. A root is worth 1 / (number of roots); a child is worth its parent's share / (number of
+       * siblings). So two top-level items are 50% each, and if one of them holds two children those are
+       * 25% each (half of the parent's 50%) no matter how many leaves the other branch carries. A leaf
+       * (no children, the only thing with a checkbox) contributes its full weight when done; a group's
+       * completion is the mean of its children, so a child counts the same however deep its own subtree runs.
+       *
+       * Each node carries Weight (its share of the whole, 0..1; leaf weights sum to 1), Fraction (its own
+       * completion, 0..1), Percent (Math.round(Fraction * 100), for display), and LeafCount / DoneCount
+       * (the raw task tally under it, for the "X of Y" readout).
        */
 
       // Build a nested tree (roots, each with a Children array) from a flat item list. Items are linked by
@@ -4262,45 +4268,74 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
         return fChildrenOf('', 0);
       }
 
-      // Annotate one node and its subtree with IsGroup / LeafCount / DoneCount / Percent, post-order.
+      // Annotate one node and its subtree with IsGroup / LeafCount / DoneCount / Fraction / Percent,
+      // post-order. A group's Fraction is the mean of its children's, so each child counts the same
+      // regardless of how many leaves it holds; LeafCount / DoneCount stay the raw task tally.
       function annotateProgress(pNode) {
         if (!pNode.Children || pNode.Children.length === 0) {
           pNode.IsGroup = false;
           pNode.LeafCount = 1;
           pNode.DoneCount = pNode.Done ? 1 : 0;
+          pNode.Fraction = pNode.Done ? 1 : 0;
           pNode.Percent = pNode.Done ? 100 : 0;
           return pNode;
         }
         pNode.IsGroup = true;
         let tmpLeaves = 0;
         let tmpDone = 0;
+        let tmpFractionSum = 0;
         for (let i = 0; i < pNode.Children.length; i++) {
           annotateProgress(pNode.Children[i]);
           tmpLeaves += pNode.Children[i].LeafCount;
           tmpDone += pNode.Children[i].DoneCount;
+          tmpFractionSum += pNode.Children[i].Fraction;
         }
         pNode.LeafCount = tmpLeaves;
         pNode.DoneCount = tmpDone;
-        pNode.Percent = tmpLeaves ? Math.round(tmpDone / tmpLeaves * 100) : 0;
+        pNode.Fraction = tmpFractionSum / pNode.Children.length;
+        pNode.Percent = Math.round(pNode.Fraction * 100);
         return pNode;
       }
 
-      // The one call the view uses: a flat item list in, { Roots, Overall } out.
+      // Distribute a node's completion weight down the tree: each node hands its share to its children in
+      // equal parts. Top-down, so it runs after the tree is built; pWeight is the node's share of the whole.
+      function assignWeights(pNode, pWeight) {
+        pNode.Weight = pWeight;
+        let tmpChildren = pNode.Children || [];
+        if (tmpChildren.length) {
+          let tmpShare = pWeight / tmpChildren.length;
+          for (let i = 0; i < tmpChildren.length; i++) {
+            assignWeights(tmpChildren[i], tmpShare);
+          }
+        }
+        return pNode;
+      }
+
+      // The one call the view uses: a flat item list in, { Roots, Overall } out. The roots split the whole
+      // 1.0 equally, so Overall completion is the mean of the roots' Fractions (a weighted roll-up), while
+      // LeafCount / DoneCount stay the raw count for the "X of Y" readout.
       function decorate(pItems) {
         let tmpRoots = buildTree(pItems);
+        let tmpRootShare = tmpRoots.length ? 1 / tmpRoots.length : 0;
         let tmpLeaves = 0;
         let tmpDone = 0;
+        let tmpFractionSum = 0;
         for (let i = 0; i < tmpRoots.length; i++) {
           annotateProgress(tmpRoots[i]);
+          assignWeights(tmpRoots[i], tmpRootShare);
           tmpLeaves += tmpRoots[i].LeafCount;
           tmpDone += tmpRoots[i].DoneCount;
+          tmpFractionSum += tmpRoots[i].Fraction;
         }
+        let tmpFraction = tmpRoots.length ? tmpFractionSum / tmpRoots.length : 0;
         return {
           Roots: tmpRoots,
           Overall: {
+            Weight: tmpRoots.length ? 1 : 0,
             LeafCount: tmpLeaves,
             DoneCount: tmpDone,
-            Percent: tmpLeaves ? Math.round(tmpDone / tmpLeaves * 100) : 0,
+            Fraction: tmpFraction,
+            Percent: Math.round(tmpFraction * 100),
             Complete: tmpLeaves > 0 && tmpDone === tmpLeaves
           }
         };
@@ -4314,6 +4349,7 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
       module.exports = {
         buildTree: buildTree,
         annotateProgress: annotateProgress,
+        assignWeights: assignWeights,
         decorate: decorate
       };
     }, {}],
@@ -4638,7 +4674,7 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
         // Indent per nesting level, in px.
         IndentPixels: 22,
         CSSPriority: 500,
-        CSS: /*css*/"\n\t\t.pict-checklist { font-family: var(--theme-typography-family-body, -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Helvetica, Arial, sans-serif); font-size: 14px; color: var(--theme-color-text-primary, #1f2430); }\n\n\t\t.pchk-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }\n\t\t.pchk-list-title { font-size: 15px; font-weight: 600; color: var(--theme-color-text-primary, #1f2430); outline: none; border-radius: 4px; padding: 2px 5px; min-width: 40px; }\n\t\t.pchk-list-title:focus { background: var(--theme-color-background-tertiary, #eef2f6); }\n\n\t\t.pchk-overall { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 170px; }\n\t\t.pchk-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--theme-color-background-tertiary, #e7ecf0); overflow: hidden; }\n\t\t.pchk-bar-fill { height: 100%; width: 0; background: var(--theme-color-brand-primary, #2880a6); border-radius: 3px; transition: width 0.18s ease; }\n\t\t.pict-checklist.pchk-complete .pchk-bar-fill { background: var(--theme-color-status-success, #2e7d4f); }\n\t\t.pchk-overall-label { font-size: 12px; color: var(--theme-color-text-secondary, #5b6470); white-space: nowrap; font-variant-numeric: tabular-nums; }\n\n\t\t.pchk-list, .pchk-children { list-style: none; margin: 0; padding: 0; }\n\t\t.pchk-children { padding-left: 22px; }\n\t\t.pchk-children:empty { display: none; }\n\n\t\t.pchk-row { display: flex; align-items: center; gap: 7px; padding: 3px 4px; border-radius: 6px; }\n\t\t.pchk-row:hover { background: var(--theme-color-background-secondary, #f7f9fb); }\n\n\t\t.pchk-caret { width: 18px; height: 18px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: var(--theme-color-text-muted, #97a1ab); border: none; background: none; padding: 0; font-size: 15px; }\n\t\t.pchk-caret:hover { color: var(--theme-color-text-secondary, #5b6470); }\n\t\t.pchk-leaf .pchk-caret { visibility: hidden; cursor: default; }\n\t\t.pchk-caret-closed { display: none; }\n\t\t.pchk-item.pchk-collapsed > .pchk-row > .pchk-caret .pchk-caret-open { display: none; }\n\t\t.pchk-item.pchk-collapsed > .pchk-row > .pchk-caret .pchk-caret-closed { display: inline-flex; }\n\n\t\t.pchk-check { width: 18px; height: 18px; flex: 0 0 auto; border: 1.5px solid var(--theme-color-border-strong, #a0a0a0); border-radius: 5px; background: var(--theme-color-background-panel, #fff); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; color: var(--theme-color-text-on-brand, #fff); font-size: 12px; padding: 0; }\n\t\t.pchk-group > .pchk-row > .pchk-check { display: none; }\n\t\t.pchk-check .pict-icon { opacity: 0; transform: scale(0.5); transition: opacity 0.1s ease, transform 0.1s ease; }\n\t\t.pchk-item.pchk-done > .pchk-row > .pchk-check { background: var(--theme-color-brand-primary, #2880a6); border-color: var(--theme-color-brand-primary, #2880a6); }\n\t\t.pchk-item.pchk-done > .pchk-row > .pchk-check .pict-icon { opacity: 1; transform: scale(1); }\n\t\t.pict-checklist.pchk-readonly .pchk-check { cursor: default; }\n\n\t\t.pchk-title { flex: 1; min-width: 0; outline: none; padding: 2px 4px; border-radius: 4px; line-height: 1.4; word-break: break-word; }\n\t\t.pchk-title:focus { background: var(--theme-color-background-tertiary, #eef2f6); box-shadow: inset 0 0 0 2px var(--theme-color-brand-primary, #2880a6); }\n\t\t.pchk-item.pchk-done > .pchk-row > .pchk-title { color: var(--theme-color-text-muted, #97a1ab); text-decoration: line-through; }\n\n\t\t.pchk-group-progress { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; flex: 0 0 auto; }\n\t\t.pchk-leaf .pchk-group-progress { display: none; }\n\t\t.pchk-minibar { width: 46px; height: 5px; border-radius: 3px; background: var(--theme-color-background-tertiary, #e7ecf0); overflow: hidden; }\n\t\t.pchk-minibar-fill { height: 100%; width: 0; background: var(--theme-color-brand-primary, #2880a6); border-radius: 3px; transition: width 0.18s ease; }\n\t\t.pchk-item.pchk-group-done > .pchk-row > .pchk-group-progress .pchk-minibar-fill { background: var(--theme-color-status-success, #2e7d4f); }\n\t\t.pchk-pct { font-size: 11px; color: var(--theme-color-text-secondary, #5b6470); min-width: 30px; text-align: right; font-variant-numeric: tabular-nums; }\n\n\t\t.pchk-actions { display: inline-flex; gap: 2px; opacity: 0; transition: opacity 0.1s ease; margin-left: 2px; flex: 0 0 auto; }\n\t\t.pchk-row:hover .pchk-actions { opacity: 1; }\n\t\t.pict-checklist.pchk-readonly .pchk-actions { display: none; }\n\t\t.pchk-actions button { border: none; background: none; cursor: pointer; color: var(--theme-color-text-muted, #97a1ab); width: 22px; height: 22px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; font-size: 14px; padding: 0; }\n\t\t.pchk-actions button:hover { background: var(--theme-color-background-hover, #eef2f6); color: var(--theme-color-text-secondary, #5b6470); }\n\t\t.pchk-actions .pchk-del:hover { color: var(--theme-color-status-error, #c0392b); }\n\n\t\t.pchk-add { display: flex; align-items: center; gap: 7px; padding: 5px 4px; margin-top: 2px; }\n\t\t.pchk-add-icon { width: 18px; flex: 0 0 auto; display: inline-flex; justify-content: center; color: var(--theme-color-text-muted, #97a1ab); }\n\t\t.pchk-add-btn { align-items: center; border: none; background: none; padding: 0; cursor: pointer; border-radius: 4px; }\n\t\t.pchk-add-btn:hover { color: var(--theme-color-brand-primary, #2880a6); }\n\t\t.pchk-add-input { flex: 1; border: none; outline: none; background: none; font: inherit; color: var(--theme-color-text-primary, #1f2430); padding: 2px 4px; }\n\t\t.pchk-add-input::placeholder { color: var(--theme-color-text-muted, #97a1ab); }\n\t\t.pict-checklist.pchk-readonly .pchk-add { display: none; }\n\n\t\t.pchk-empty { color: var(--theme-color-text-muted, #97a1ab); font-size: 13px; padding: 8px 4px; }\n\t",
+        CSS: /*css*/"\n\t\t.pict-checklist { font-family: var(--theme-typography-family-body, -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, Helvetica, Arial, sans-serif); font-size: 14px; color: var(--theme-color-text-primary, #1f2430); container-type: inline-size; }\n\n\t\t.pchk-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }\n\t\t.pchk-list-title { font-size: 15px; font-weight: 600; color: var(--theme-color-text-primary, #1f2430); outline: none; border-radius: 4px; padding: 2px 5px; min-width: 40px; }\n\t\t.pchk-list-title:focus { background: var(--theme-color-background-tertiary, #eef2f6); }\n\n\t\t.pchk-overall { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 170px; }\n\t\t.pchk-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--theme-color-background-tertiary, #e7ecf0); overflow: hidden; }\n\t\t.pchk-bar-fill { height: 100%; width: 0; background: var(--theme-color-brand-primary, #2880a6); border-radius: 3px; transition: width 0.18s ease; }\n\t\t.pict-checklist.pchk-complete .pchk-bar-fill { background: var(--theme-color-status-success, #2e7d4f); }\n\t\t.pchk-overall-label { font-size: 12px; color: var(--theme-color-text-secondary, #5b6470); white-space: nowrap; font-variant-numeric: tabular-nums; }\n\n\t\t.pchk-list, .pchk-children { list-style: none; margin: 0; padding: 0; }\n\t\t.pchk-children { padding-left: 22px; }\n\t\t.pchk-children:empty { display: none; }\n\n\t\t.pchk-row { display: flex; align-items: center; gap: 7px; padding: 3px 4px; border-radius: 6px; }\n\t\t.pchk-row:hover { background: var(--theme-color-background-secondary, #f7f9fb); }\n\n\t\t.pchk-caret { width: 18px; height: 18px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: var(--theme-color-text-muted, #97a1ab); border: none; background: none; padding: 0; font-size: 15px; }\n\t\t.pchk-caret:hover { color: var(--theme-color-text-secondary, #5b6470); }\n\t\t.pchk-leaf .pchk-caret { visibility: hidden; cursor: default; }\n\t\t.pchk-caret-closed { display: none; }\n\t\t.pchk-item.pchk-collapsed > .pchk-row > .pchk-caret .pchk-caret-open { display: none; }\n\t\t.pchk-item.pchk-collapsed > .pchk-row > .pchk-caret .pchk-caret-closed { display: inline-flex; }\n\n\t\t.pchk-check { width: 18px; height: 18px; flex: 0 0 auto; border: 1.5px solid var(--theme-color-border-strong, #a0a0a0); border-radius: 5px; background: var(--theme-color-background-panel, #fff); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; color: var(--theme-color-text-on-brand, #fff); font-size: 12px; padding: 0; }\n\t\t.pchk-group > .pchk-row > .pchk-check { display: none; }\n\t\t.pchk-check .pict-icon { opacity: 0; transform: scale(0.5); transition: opacity 0.1s ease, transform 0.1s ease; }\n\t\t.pchk-item.pchk-done > .pchk-row > .pchk-check { background: var(--theme-color-brand-primary, #2880a6); border-color: var(--theme-color-brand-primary, #2880a6); }\n\t\t.pchk-item.pchk-done > .pchk-row > .pchk-check .pict-icon { opacity: 1; transform: scale(1); }\n\t\t.pict-checklist.pchk-readonly .pchk-check { cursor: default; }\n\n\t\t.pchk-title { flex: 1; min-width: 0; outline: none; padding: 2px 4px; border-radius: 4px; line-height: 1.4; word-break: break-word; }\n\t\t.pchk-title:focus { background: var(--theme-color-background-tertiary, #eef2f6); box-shadow: inset 0 0 0 2px var(--theme-color-brand-primary, #2880a6); }\n\t\t.pchk-item.pchk-done > .pchk-row > .pchk-title { color: var(--theme-color-text-muted, #97a1ab); text-decoration: line-through; }\n\n\t\t.pchk-group-progress { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; flex: 0 0 auto; }\n\t\t.pchk-leaf .pchk-group-progress { display: none; }\n\t\t.pchk-minibar { width: 46px; height: 5px; border-radius: 3px; background: var(--theme-color-background-tertiary, #e7ecf0); overflow: hidden; }\n\t\t.pchk-minibar-fill { height: 100%; width: 0; background: var(--theme-color-brand-primary, #2880a6); border-radius: 3px; transition: width 0.18s ease; }\n\t\t.pchk-item.pchk-group-done > .pchk-row > .pchk-group-progress .pchk-minibar-fill { background: var(--theme-color-status-success, #2e7d4f); }\n\t\t.pchk-pct { font-size: 11px; color: var(--theme-color-text-secondary, #5b6470); min-width: 30px; text-align: right; font-variant-numeric: tabular-nums; }\n\n\t\t.pchk-actions { display: inline-flex; gap: 2px; opacity: 0; transition: opacity 0.1s ease; margin-left: 2px; flex: 0 0 auto; }\n\t\t.pchk-row:hover .pchk-actions { opacity: 1; }\n\t\t.pict-checklist.pchk-readonly .pchk-actions { display: none; }\n\t\t.pchk-actions button { border: none; background: none; cursor: pointer; color: var(--theme-color-text-muted, #97a1ab); width: 22px; height: 22px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; font-size: 14px; padding: 0; }\n\t\t.pchk-actions button:hover { background: var(--theme-color-background-hover, #eef2f6); color: var(--theme-color-text-secondary, #5b6470); }\n\t\t.pchk-actions .pchk-del:hover { color: var(--theme-color-status-error, #c0392b); }\n\n\t\t.pchk-add { display: flex; align-items: center; gap: 7px; padding: 5px 4px; margin-top: 2px; }\n\t\t.pchk-add-icon { width: 18px; flex: 0 0 auto; display: inline-flex; justify-content: center; color: var(--theme-color-text-muted, #97a1ab); }\n\t\t.pchk-add-btn { align-items: center; border: none; background: none; padding: 0; cursor: pointer; border-radius: 4px; }\n\t\t.pchk-add-btn:hover { color: var(--theme-color-brand-primary, #2880a6); }\n\t\t.pchk-add-input { flex: 1; border: none; outline: none; background: none; font: inherit; color: var(--theme-color-text-primary, #1f2430); padding: 2px 4px; }\n\t\t.pchk-add-input::placeholder { color: var(--theme-color-text-muted, #97a1ab); }\n\t\t.pict-checklist.pchk-readonly .pchk-add { display: none; }\n\n\t\t.pchk-empty { color: var(--theme-color-text-muted, #97a1ab); font-size: 13px; padding: 8px 4px; }\n\n\t\t/* Touch devices have no hover, so the per-row actions (add sub-item, delete) must always show or\n\t\t   they are unreachable -- this is what let deleting fail on a phone. */\n\t\t@media (hover: none)\n\t\t{\n\t\t\t.pchk-actions { opacity: 1; }\n\t\t}\n\n\t\t/* Narrow container (a sidebar rail, a phone-width column): the header must not force horizontal\n\t\t   overflow, so drop the wide progress bar to a compact percentage, let the title take the row, and\n\t\t   hide the per-group mini-bar (the percentage still shows). Uses container queries so it responds to\n\t\t   the checklist's own width, not the viewport -- a docked sidebar is narrow even on a wide screen. */\n\t\t@container (max-width: 340px)\n\t\t{\n\t\t\t.pchk-header { flex-wrap: wrap; gap: 6px 8px; }\n\t\t\t.pchk-list-title { flex: 1 1 auto; min-width: 0; }\n\t\t\t.pchk-overall { min-width: 0; gap: 6px; }\n\t\t\t.pchk-bar { display: none; }\n\t\t\t.pchk-minibar { display: none; }\n\t\t\t.pchk-children { padding-left: 16px; }\n\t\t\t.pchk-actions { opacity: 1; }\n\t\t}\n\t",
         Templates: [{
           Hash: 'Checklist-Section',
           Template: /*html*/"\n<div class=\"{~D:AppData.ChecklistActive.ContainerClass~}\" id=\"Checklist-Root-{~D:AppData.ChecklistActive.ViewHash~}\">\n\t<div class=\"pchk-header\">\n\t\t<span class=\"pchk-list-title\" id=\"{~D:AppData.ChecklistActive.TitleInputId~}\" {~D:AppData.ChecklistActive.List.EditAttr~} onkeydown=\"if (event.key === 'Enter') { event.preventDefault(); this.blur(); }\" onblur=\"_Pict.views['{~D:AppData.ChecklistActive.ViewHash~}'].commitListTitle(this)\">{~D:AppData.ChecklistActive.List.Title~}</span>\n\t\t{~TS:Checklist-Progress:AppData.ChecklistActive.ProgressSlot~}\n\t</div>\n\t<ul class=\"pchk-list\">{~TS:Checklist-Item:AppData.ChecklistActive.Roots~}</ul>\n\t{~TS:Checklist-Empty:AppData.ChecklistActive.EmptySlot~}\n\t{~TS:Checklist-Add:AppData.ChecklistActive.AddSlot~}\n</div>"
@@ -4650,7 +4686,7 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
           Template: /*html*/"\n<li class=\"{~D:Record.RowClass~}\" data-key=\"{~D:Record.Key~}\">\n\t<div class=\"pchk-row\">\n\t\t<button class=\"pchk-caret\" type=\"button\" title=\"Collapse / expand\" onclick=\"_Pict.views['{~D:Record.ViewHash~}'].toggleCollapse('{~D:Record.Key~}')\"><span class=\"pchk-caret-open\">{~I:ChevronDown~}</span><span class=\"pchk-caret-closed\">{~I:ChevronRight~}</span></button>\n\t\t<button class=\"pchk-check\" type=\"button\" title=\"Toggle done\" onclick=\"_Pict.views['{~D:Record.ViewHash~}'].toggleItem('{~D:Record.Key~}')\">{~I:Check~}</button>\n\t\t<span class=\"pchk-title\" id=\"{~D:Record.InputId~}\" {~D:Record.EditAttr~} onkeydown=\"_Pict.views['{~D:Record.ViewHash~}'].onTitleKeydown('{~D:Record.Key~}', event, this)\" onblur=\"_Pict.views['{~D:Record.ViewHash~}'].commitTitle('{~D:Record.Key~}', this)\">{~D:Record.Title~}</span>\n\t\t<span class=\"pchk-group-progress\"><span class=\"pchk-minibar\"><span class=\"pchk-minibar-fill\" style=\"width:{~D:Record.Percent~}%\"></span></span><span class=\"pchk-pct\">{~D:Record.Percent~}%</span></span>\n\t\t<span class=\"pchk-actions\"><button type=\"button\" class=\"pchk-addchild\" title=\"Add sub-item\" onclick=\"_Pict.views['{~D:Record.ViewHash~}'].addChild('{~D:Record.Key~}')\">{~I:Plus~}</button><button type=\"button\" class=\"pchk-del\" title=\"Delete\" onclick=\"_Pict.views['{~D:Record.ViewHash~}'].confirmDelete('{~D:Record.Key~}')\">{~I:Trash~}</button></span>\n\t</div>\n\t<ul class=\"pchk-children\">{~TS:Checklist-Item:Record.Children~}</ul>\n</li>"
         }, {
           Hash: 'Checklist-Add',
-          Template: /*html*/"<div class=\"pchk-add\"><button type=\"button\" class=\"pchk-add-icon pchk-add-btn\" title=\"Add an item\" onclick=\"_Pict.views['{~D:Record.ViewHash~}'].addRootEmpty()\">{~I:Plus~}</button><input class=\"pchk-add-input\" id=\"{~D:Record.AddInputId~}\" type=\"text\" placeholder=\"{~D:Record.AddPlaceholder~}\" autocomplete=\"off\" onkeydown=\"if (event.key === 'Enter') { event.preventDefault(); _Pict.views['{~D:Record.ViewHash~}'].addItem(); } else if (event.key === 'Escape') { this.value = ''; this.blur(); }\"></div>"
+          Template: /*html*/"<div class=\"pchk-add\"><button type=\"button\" class=\"pchk-add-icon pchk-add-btn\" title=\"Add an item\" onclick=\"_Pict.views['{~D:Record.ViewHash~}'].addItem()\">{~I:Plus~}</button><input class=\"pchk-add-input\" id=\"{~D:Record.AddInputId~}\" type=\"text\" placeholder=\"{~D:Record.AddPlaceholder~}\" autocomplete=\"off\" onkeydown=\"if (event.key === 'Enter') { event.preventDefault(); _Pict.views['{~D:Record.ViewHash~}'].addItem(); } else if (event.key === 'Escape') { this.value = ''; this.blur(); }\"></div>"
         }, {
           Hash: 'Checklist-Empty',
           Template: /*html*/"<div class=\"pchk-empty\">{~D:Record.Message~}</div>"
@@ -4870,7 +4906,12 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
           }
           let tmpInput = typeof document !== 'undefined' ? document.getElementById(this._active.AddInputId) : null;
           let tmpTitle = tmpInput ? String(tmpInput.value || '').trim() : '';
+          // Empty add (the "+" clicked with nothing typed, or Enter on a blank field): just put the cursor in
+          // the input. There is one add flow -- type, then Enter or "+" -- so a click never discards typed text.
           if (!tmpTitle) {
+            if (tmpInput) {
+              tmpInput.focus();
+            }
             return Promise.resolve();
           }
           if (tmpInput) {
@@ -4882,23 +4923,6 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
             ParentKey: null,
             Title: tmpTitle
           }).then(pItem => {
-            this._fire('onItemAdded', pItem);
-            return this._reloadAndChange();
-          });
-        }
-
-        // The "+" beside the add input: drop an empty item at the end of the list and put the cursor in it,
-        // so a click-then-type flow works alongside typing in the input and pressing Enter to continue.
-        addRootEmpty() {
-          if (this.options.ReadOnly || !this._list) {
-            return Promise.resolve();
-          }
-          return this._provider.createItem({
-            ListKey: this._list.Key,
-            ParentKey: null,
-            Title: ''
-          }).then(pItem => {
-            this._ui.FocusKey = pItem.Key;
             this._fire('onItemAdded', pItem);
             return this._reloadAndChange();
           });

@@ -62,7 +62,7 @@ const _DefaultConfiguration =
 
 	CSSPriority: 500,
 	CSS: /*css*/`
-		.pict-checklist { font-family: var(--theme-typography-family-body, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif); font-size: 14px; color: var(--theme-color-text-primary, #1f2430); }
+		.pict-checklist { font-family: var(--theme-typography-family-body, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif); font-size: 14px; color: var(--theme-color-text-primary, #1f2430); container-type: inline-size; }
 
 		.pchk-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
 		.pchk-list-title { font-size: 15px; font-weight: 600; color: var(--theme-color-text-primary, #1f2430); outline: none; border-radius: 4px; padding: 2px 5px; min-width: 40px; }
@@ -122,6 +122,28 @@ const _DefaultConfiguration =
 		.pict-checklist.pchk-readonly .pchk-add { display: none; }
 
 		.pchk-empty { color: var(--theme-color-text-muted, #97a1ab); font-size: 13px; padding: 8px 4px; }
+
+		/* Touch devices have no hover, so the per-row actions (add sub-item, delete) must always show or
+		   they are unreachable -- this is what let deleting fail on a phone. */
+		@media (hover: none)
+		{
+			.pchk-actions { opacity: 1; }
+		}
+
+		/* Narrow container (a sidebar rail, a phone-width column): the header must not force horizontal
+		   overflow, so drop the wide progress bar to a compact percentage, let the title take the row, and
+		   hide the per-group mini-bar (the percentage still shows). Uses container queries so it responds to
+		   the checklist's own width, not the viewport -- a docked sidebar is narrow even on a wide screen. */
+		@container (max-width: 340px)
+		{
+			.pchk-header { flex-wrap: wrap; gap: 6px 8px; }
+			.pchk-list-title { flex: 1 1 auto; min-width: 0; }
+			.pchk-overall { min-width: 0; gap: 6px; }
+			.pchk-bar { display: none; }
+			.pchk-minibar { display: none; }
+			.pchk-children { padding-left: 16px; }
+			.pchk-actions { opacity: 1; }
+		}
 	`,
 
 	Templates:
@@ -159,7 +181,7 @@ const _DefaultConfiguration =
 		},
 		{
 			Hash: 'Checklist-Add',
-			Template: /*html*/`<div class="pchk-add"><button type="button" class="pchk-add-icon pchk-add-btn" title="Add an item" onclick="_Pict.views['{~D:Record.ViewHash~}'].addRootEmpty()">{~I:Plus~}</button><input class="pchk-add-input" id="{~D:Record.AddInputId~}" type="text" placeholder="{~D:Record.AddPlaceholder~}" autocomplete="off" onkeydown="if (event.key === 'Enter') { event.preventDefault(); _Pict.views['{~D:Record.ViewHash~}'].addItem(); } else if (event.key === 'Escape') { this.value = ''; this.blur(); }"></div>`
+			Template: /*html*/`<div class="pchk-add"><button type="button" class="pchk-add-icon pchk-add-btn" title="Add an item" onclick="_Pict.views['{~D:Record.ViewHash~}'].addItem()">{~I:Plus~}</button><input class="pchk-add-input" id="{~D:Record.AddInputId~}" type="text" placeholder="{~D:Record.AddPlaceholder~}" autocomplete="off" onkeydown="if (event.key === 'Enter') { event.preventDefault(); _Pict.views['{~D:Record.ViewHash~}'].addItem(); } else if (event.key === 'Escape') { this.value = ''; this.blur(); }"></div>`
 		},
 		{
 			Hash: 'Checklist-Empty',
@@ -373,20 +395,13 @@ class PictViewChecklist extends libPictView
 		if (this.options.ReadOnly || !this._list) { return Promise.resolve(); }
 		let tmpInput = (typeof document !== 'undefined') ? document.getElementById(this._active.AddInputId) : null;
 		let tmpTitle = tmpInput ? String(tmpInput.value || '').trim() : '';
-		if (!tmpTitle) { return Promise.resolve(); }
+		// Empty add (the "+" clicked with nothing typed, or Enter on a blank field): just put the cursor in
+		// the input. There is one add flow -- type, then Enter or "+" -- so a click never discards typed text.
+		if (!tmpTitle) { if (tmpInput) { tmpInput.focus(); } return Promise.resolve(); }
 		if (tmpInput) { tmpInput.value = ''; }
 		this._ui.FocusKey = '__add__';
 		return this._provider.createItem({ ListKey: this._list.Key, ParentKey: null, Title: tmpTitle })
 			.then((pItem) => { this._fire('onItemAdded', pItem); return this._reloadAndChange(); });
-	}
-
-	// The "+" beside the add input: drop an empty item at the end of the list and put the cursor in it,
-	// so a click-then-type flow works alongside typing in the input and pressing Enter to continue.
-	addRootEmpty()
-	{
-		if (this.options.ReadOnly || !this._list) { return Promise.resolve(); }
-		return this._provider.createItem({ ListKey: this._list.Key, ParentKey: null, Title: '' })
-			.then((pItem) => { this._ui.FocusKey = pItem.Key; this._fire('onItemAdded', pItem); return this._reloadAndChange(); });
 	}
 
 	addChild(pKey)
